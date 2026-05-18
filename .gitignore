@@ -48,6 +48,10 @@ ENV/
 *.tmp
 *.temp
 
+# Test reports
+test_report.json
+*_bugs_*.json
+
 # OS files
 .DS_Store
 Thumbs.db
