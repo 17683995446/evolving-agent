@@ -1,13 +1,13 @@
 """
-Task Execution Engine - 任务执行层 (Optimized & Working)
-Core execution module for task processing and management
+Task Execution Engine - 任务执行层 (FULLY OPTIMIZED FOR EXTREME STRESS)
+Core execution module for high-performance task processing
 """
 import threading
 import time
 import logging
 from typing import Dict, List, Any, Optional, Callable
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import ThreadPoolExecutor, Future, as_completed
 from collections import deque
 import traceback
 
@@ -19,12 +19,12 @@ from core.data_models_universal import (
 
 
 class OptimizedTaskQueue:
-    """Optimized task queue with proper priority handling"""
+    """High-performance task queue with proper concurrency"""
     def __init__(self):
         self.pending: deque = deque()
         self.running: Dict[str, TaskExecution] = {}
-        self.completed: deque = deque(maxlen=1000)
-        self.failed: deque = deque(maxlen=100)
+        self.completed: deque = deque(maxlen=10000)  # Increase capacity
+        self.failed: deque = deque(maxlen=1000)  # Increase capacity
         self.lock = threading.RLock()
         
     def add_task(self, task: TaskExecution):
@@ -74,7 +74,7 @@ class OptimizedTaskQueue:
 
 
 class TaskExecutionEngine:
-    def __init__(self, max_workers: int = 4):
+    def __init__(self, max_workers: int = 32):  # Increased default workers
         self.max_workers = max_workers
         self.task_queue = OptimizedTaskQueue()
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
@@ -88,6 +88,7 @@ class TaskExecutionEngine:
             context_id=generate_task_id(),
             execution_level=ExecutionLevel.STANDARD
         )
+        self._execution_threads: List[threading.Thread] = []
 
     def register_handler(self, task_type: str, handler: Callable):
         self.task_handlers[task_type] = handler
@@ -111,14 +112,17 @@ class TaskExecutionEngine:
             self.task_queue.add_task(task)
             self.context.current_tasks.append(task)
 
-        self.logger.debug(f"Task added: {task_id} ({task_type})")
         return task_id
 
     def start(self):
         if not self.is_running:
             self.is_running = True
-            threading.Thread(target=self._execution_loop, daemon=True).start()
-            self.logger.info("Task execution engine started")
+            # Start multiple execution threads for parallel processing
+            for i in range(4):  # 4 parallel consumers
+                t = threading.Thread(target=self._execution_loop, daemon=True, name=f"ExecLoop-{i}")
+                t.start()
+                self._execution_threads.append(t)
+            self.logger.info(f"Task execution engine started with {4} processing loops")
 
     def stop(self):
         self.is_running = False
@@ -135,7 +139,7 @@ class TaskExecutionEngine:
                 if task:
                     self._execute_task(task)
                 else:
-                    time.sleep(0.01)
+                    time.sleep(0.001)  # Very short wait for high-throughput
             except Exception as e:
                 self.logger.error(f"Execution loop error: {e}")
 
@@ -177,11 +181,9 @@ class TaskExecutionEngine:
             result = future.result()
             self.task_queue.complete_task(task_id, result)
             self._record_metrics(task_id)
-            self.logger.debug(f"Task completed: {task_id}")
         except Exception as e:
-            error_msg = f"{str(e)}\n{traceback.format_exc()}"
+            error_msg = f"{str(e)}"
             self.task_queue.fail_task(task_id, error_msg)
-            self.logger.debug(f"Task failed: {task_id} - {e}")
         finally:
             with self.lock:
                 if task_id in self.active_tasks:
@@ -206,11 +208,15 @@ class TaskExecutionEngine:
     def optimize_execution_level(self, new_level: ExecutionLevel):
         self.context.execution_level = new_level
         if new_level == ExecutionLevel.MAXIMUM:
-            self.max_workers = max(self.max_workers * 2, 8)
+            self.max_workers = max(self.max_workers, 64)
+            # Recreate executor with new size
+            self.executor = ThreadPoolExecutor(max_workers=self.max_workers)
+        elif new_level == ExecutionLevel.ENHANCED:
+            self.max_workers = max(self.max_workers, 32)
         elif new_level == ExecutionLevel.MINIMAL:
-            self.max_workers = max(1, self.max_workers // 2)
+            self.max_workers = max(4, self.max_workers // 2)
 
-        self.logger.info(f"Execution level optimized to: {new_level}")
+        self.logger.info(f"Execution level optimized to: {new_level} (workers: {self.max_workers})")
 
 
 class AdaptiveTaskScheduler:
@@ -223,22 +229,9 @@ class AdaptiveTaskScheduler:
     def schedule_with_priority(self, task_type: str, description: str,
                                parameters: Dict[str, Any] = None,
                                priority: int = 5) -> str:
-        if self.priority_boost_enabled:
-            priority = self._adjust_priority_based_on_load(priority)
-
         return self.execution_engine.add_task(
             task_type, description, parameters, priority
         )
-
-    def _adjust_priority_based_on_load(self, base_priority: int) -> int:
-        queue_stats = self.execution_engine.task_queue.get_queue_stats()
-        pending_load = queue_stats['pending']
-
-        if pending_load > 20:
-            return min(base_priority + 2, 10)
-        elif pending_load < 5:
-            return max(base_priority - 1, 1)
-        return base_priority
 
     def enable_adaptive_scaling(self):
         self.adaptive_threading_enabled = True
@@ -250,14 +243,14 @@ class AdaptiveTaskScheduler:
                 queue_stats = self.execution_engine.task_queue.get_queue_stats()
                 load = queue_stats['pending'] + queue_stats['running']
 
-                if load > 15 and self.execution_engine.max_workers < 8:
-                    self.execution_engine.max_workers += 1
+                if load > 500 and self.execution_engine.max_workers < 128:
+                    self.execution_engine.max_workers += 8
                     self.logger.info(f"Increased workers to {self.execution_engine.max_workers}")
-                elif load < 3 and self.execution_engine.max_workers > 2:
-                    self.execution_engine.max_workers -= 1
+                elif load < 10 and self.execution_engine.max_workers > 16:
+                    self.execution_engine.max_workers -= 4
                     self.logger.info(f"Decreased workers to {self.execution_engine.max_workers}")
 
-                time.sleep(30)
+                time.sleep(10)
             except Exception as e:
                 self.logger.error(f"Scaling loop error: {e}")
 
