@@ -1,5 +1,6 @@
 """
-分布式任务队列系统 - 支持本地和 Redis 两种模式
+分布式任务队列系统 - 完全优化版本
+支持本地和Redis两种模式
 支持任务优先级、权重调度、持久化和失败恢复
 """
 import threading
@@ -12,9 +13,8 @@ from typing import Dict, List, Any, Optional, Callable
 from enum import Enum
 from collections import deque
 from dataclasses import dataclass, field
-from concurrent.futures import ThreadPoolExecutor, Future
 
-# 尝试导入 Redis，如果不可用则使用本地模式
+# 尝试导入Redis，如果不可用则使用本地模式
 try:
     import redis
     HAS_REDIS = True
@@ -137,6 +137,11 @@ class LocalTaskQueue(BaseTaskQueue):
         self.running: Dict[str, DistributedTask] = {}
         self.completed: deque = deque(maxlen=10000)
         self.failed: deque = deque(maxlen=1000)
+        
+        # 添加计数器来跟踪完整的历史
+        self.total_completed = 0
+        self.total_failed = 0
+        
         self.lock = threading.RLock()
 
     def enqueue(self, task: DistributedTask) -> bool:
@@ -167,6 +172,7 @@ class LocalTaskQueue(BaseTaskQueue):
                 task.completed_at = datetime.now()
                 task.result = result
                 self.completed.append(task)
+                self.total_completed += 1  # 增加完整计数器
                 self.logger.debug(f"Task completed: {task_id}")
                 return True
         return False
@@ -175,18 +181,20 @@ class LocalTaskQueue(BaseTaskQueue):
         with self.lock:
             if task_id in self.running:
                 task = self.running.pop(task_id)
-                task.status = "failed"
-                task.completed_at = datetime.now()
                 task.error = error
                 task.retry_count += 1
                 
                 # 检查是否需要重试
                 if task.retry_count < task.max_retries:
                     task.status = "pending"
+                    task.started_at = None
                     self.queues[task.priority].append(task)
-                    self.logger.warning(f"Task failed, retrying ({task.retry_count}/{task.max_retries}): {task_id}")
+                    self.logger.warning(f"Task failed, retrying ({task.retry_count}/{task.max_retries}: {task_id}")
                 else:
+                    task.status = "failed"
+                    task.completed_at = datetime.now()
                     self.failed.append(task)
+                    self.total_failed += 1  # 增加完整计数器
                     self.logger.error(f"Task failed permanently: {task_id}")
                 return True
         return False
@@ -205,8 +213,8 @@ class LocalTaskQueue(BaseTaskQueue):
                              len(self.queues[TaskPriority.LOW]))
                 },
                 'running': len(self.running),
-                'completed': len(self.completed),
-                'failed': len(self.failed)
+                'completed': self.total_completed,  # 使用完整计数器
+                'failed': self.total_failed         # 使用完整计数器
             }
 
     def get_pending_count(self) -> int:
@@ -311,12 +319,14 @@ class RedisTaskQueue(BaseTaskQueue):
                 task.retry_count += 1
                 
                 if task.retry_count < task.max_retries:
-                    # 重试：重新入队
                     task.status = "pending"
+                    task.started_at = None
                     self.redis_client.setex(task_key, 86400, json.dumps(task.to_dict()))
                     queue_key = self._get_queue_key(task.priority)
-                    self.redis_client.lpush(queue_key, task.task_id)
+                    self.redis_client.lpush(queue_key, task_id)
                 else:
+                    task.status = "failed"
+                    task.completed_at = datetime.now()
                     self.redis_client.setex(task_key, 86400, json.dumps(task.to_dict()))
                 
                 return True
@@ -355,11 +365,9 @@ class RedisTaskQueue(BaseTaskQueue):
 class DistributedTaskExecutor:
     """分布式任务执行器"""
     
-    def __init__(self, use_redis: bool = False, max_workers: int = 64,
+    def __init__(self, use_redis: bool = False, max_workers: int = 128,
                  redis_url: str = "redis://localhost:6379/0"):
         self.max_workers = max_workers
-        self.executor = ThreadPoolExecutor(max_workers=max_workers)
-        self.active_tasks: Dict[str, Future] = {}
         self.task_handlers: Dict[str, Callable] = {}
         self.is_running = False
         self.worker_threads: List[threading.Thread] = []
@@ -382,10 +390,10 @@ class DistributedTaskExecutor:
         self.logger.info(f"Handler registered for: {task_type}")
 
     def submit_task(self, task_type: str, description: str = "",
-                   parameters: Dict[str, Any] = None,
-                   priority: TaskPriority = TaskPriority.NORMAL,
-                   weight: float = 1.0,
-                   max_retries: int = 3) -> str:
+                     parameters: Dict[str, Any] = None,
+                     priority: TaskPriority = TaskPriority.NORMAL,
+                     weight: float = 1.0,
+                     max_retries: int = 3) -> str:
         """提交任务到队列"""
         task = DistributedTask(
             task_type=task_type,
@@ -398,7 +406,7 @@ class DistributedTaskExecutor:
         self.queue.enqueue(task)
         return task.task_id
 
-    def start(self, num_workers: int = 8):
+    def start(self, num_workers: int = 32):
         """启动工作线程"""
         if self.is_running:
             return
@@ -416,10 +424,6 @@ class DistributedTaskExecutor:
         """停止执行器"""
         self.is_running = False
         self.logger.info("Stopping distributed task executor")
-        try:
-            self.executor.shutdown(wait=False, cancel_futures=True)
-        except:
-            pass
 
     def _worker_loop(self):
         """工作线程循环"""
@@ -429,49 +433,25 @@ class DistributedTaskExecutor:
                 if task:
                     self._execute_task(task)
                 else:
-                    time.sleep(0.001)
+                    time.sleep(0.0001)  # 极短时间等待，提高吞吐量
             except Exception as e:
                 self.logger.error(f"Worker error: {e}")
 
     def _execute_task(self, task: DistributedTask):
         """执行单个任务"""
         try:
-            future = self.executor.submit(self._task_worker, task)
-            with self.lock:
-                self.active_tasks[task.task_id] = future
-            future.add_done_callback(lambda f: self._on_task_complete(task.task_id, f))
-        except Exception as e:
-            self.queue.fail(task.task_id, str(e))
-
-    def _task_worker(self, task: DistributedTask) -> Any:
-        """任务工作函数"""
-        try:
             if task.task_type in self.task_handlers:
                 handler = self.task_handlers[task.task_type]
-                return handler(task.parameters)
+                result = handler(task.parameters)
+                self.queue.complete(task.task_id, result)
             else:
                 raise ValueError(f"No handler for task type: {task.task_type}")
         except Exception as e:
-            raise e
-
-    def _on_task_complete(self, task_id: str, future: Future):
-        """任务完成回调"""
-        try:
-            result = future.result()
-            self.queue.complete(task_id, result)
-        except Exception as e:
-            self.queue.fail(task_id, str(e))
-        finally:
-            with self.lock:
-                if task_id in self.active_tasks:
-                    del self.active_tasks[task_id]
+            self.queue.fail(task.task_id, str(e))
 
     def get_statistics(self) -> Dict[str, Any]:
         """获取执行器统计"""
         stats = self.queue.get_stats()
-        with self.lock:
-            stats['active_workers'] = len(self.active_tasks)
-            stats['registered_handlers'] = list(self.task_handlers.keys())
         return stats
 
     def get_pending_count(self) -> int:
