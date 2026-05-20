@@ -182,19 +182,19 @@ class LocalTaskQueue(BaseTaskQueue):
             if task_id in self.running:
                 task = self.running.pop(task_id)
                 task.error = error
-                task.retry_count += 1
                 
-                # 检查是否需要重试
+                # 先检查是否需要重试
                 if task.retry_count < task.max_retries:
+                    task.retry_count += 1
                     task.status = "pending"
                     task.started_at = None
                     self.queues[task.priority].append(task)
-                    # 减少日志输出频率
                 else:
+                    task.retry_count += 1
                     task.status = "failed"
                     task.completed_at = datetime.now()
                     self.failed.append(task)
-                    self.total_failed += 1  # 增加完整计数器
+                    self.total_failed += 1
                 return True
         return False
 
@@ -240,6 +240,13 @@ class RedisTaskQueue(BaseTaskQueue):
             TaskPriority.NORMAL: "normal",
             TaskPriority.LOW: "low"
         }
+        
+        # 本地缓存和计数器
+        self.running: Dict[str, DistributedTask] = {}
+        self.total_completed = 0
+        self.total_failed = 0
+        self.lock = threading.RLock()
+        
         self.logger.info("Redis task queue initialized")
 
     def _get_queue_key(self, priority: TaskPriority) -> str:
@@ -265,96 +272,109 @@ class RedisTaskQueue(BaseTaskQueue):
             return False
 
     def dequeue(self) -> Optional[DistributedTask]:
-        try:
-            # 按优先级顺序尝试获取任务
-            for priority in [TaskPriority.CRITICAL, TaskPriority.HIGH,
-                            TaskPriority.NORMAL, TaskPriority.LOW]:
-                queue_key = self._get_queue_key(priority)
-                task_id = self.redis_client.rpop(queue_key)
-                
-                if task_id:
-                    task_id = task_id.decode('utf-8')
-                    task_key = self._get_task_key(task_id)
-                    task_data = self.redis_client.get(task_key)
+        with self.lock:
+            try:
+                # 按优先级顺序尝试获取任务
+                for priority in [TaskPriority.CRITICAL, TaskPriority.HIGH,
+                                TaskPriority.NORMAL, TaskPriority.LOW]:
+                    queue_key = self._get_queue_key(priority)
+                    task_id = self.redis_client.rpop(queue_key)
                     
-                    if task_data:
-                        task = DistributedTask.from_dict(json.loads(task_data))
-                        task.status = "running"
-                        task.started_at = datetime.now()
-                        self.redis_client.setex(task_key, 86400, json.dumps(task.to_dict()))
-                        return task
-            return None
-        except Exception as e:
-            self.logger.error(f"Failed to dequeue from Redis: {e}")
-            return None
+                    if task_id:
+                        task_id = task_id.decode('utf-8')
+                        task_key = self._get_task_key(task_id)
+                        task_data = self.redis_client.get(task_key)
+                        
+                        if task_data:
+                            task = DistributedTask.from_dict(json.loads(task_data))
+                            task.status = "running"
+                            task.started_at = datetime.now()
+                            self.redis_client.setex(task_key, 86400, json.dumps(task.to_dict()))
+                            self.running[task.task_id] = task
+                            return task
+                return None
+            except Exception as e:
+                self.logger.error(f"Failed to dequeue from Redis: {e}")
+                return None
 
     def complete(self, task_id: str, result: Any) -> bool:
-        try:
-            task_key = self._get_task_key(task_id)
-            task_data = self.redis_client.get(task_key)
-            
-            if task_data:
-                task = DistributedTask.from_dict(json.loads(task_data))
-                task.status = "completed"
-                task.completed_at = datetime.now()
-                task.result = result
-                self.redis_client.setex(task_key, 86400, json.dumps(task.to_dict()))
-                return True
-            return False
-        except Exception as e:
-            self.logger.error(f"Failed to mark complete in Redis: {e}")
-            return False
+        with self.lock:
+            try:
+                if task_id in self.running:
+                    task = self.running.pop(task_id)
+                    
+                    task_key = self._get_task_key(task_id)
+                    task.status = "completed"
+                    task.completed_at = datetime.now()
+                    task.result = result
+                    self.redis_client.setex(task_key, 86400, json.dumps(task.to_dict()))
+                    self.total_completed += 1
+                    self.logger.debug(f"Task completed in Redis: {task_id}")
+                    return True
+                return False
+            except Exception as e:
+                self.logger.error(f"Failed to mark complete in Redis: {e}")
+                return False
 
     def fail(self, task_id: str, error: str) -> bool:
-        try:
-            task_key = self._get_task_key(task_id)
-            task_data = self.redis_client.get(task_key)
-            
-            if task_data:
-                task = DistributedTask.from_dict(json.loads(task_data))
-                task.status = "failed"
-                task.completed_at = datetime.now()
-                task.error = error
-                task.retry_count += 1
-                
-                if task.retry_count < task.max_retries:
-                    task.status = "pending"
-                    task.started_at = None
-                    self.redis_client.setex(task_key, 86400, json.dumps(task.to_dict()))
-                    queue_key = self._get_queue_key(task.priority)
-                    self.redis_client.lpush(queue_key, task_id)
-                else:
-                    task.status = "failed"
-                    task.completed_at = datetime.now()
-                    self.redis_client.setex(task_key, 86400, json.dumps(task.to_dict()))
-                
-                return True
-            return False
-        except Exception as e:
-            self.logger.error(f"Failed to mark failed in Redis: {e}")
-            return False
+        with self.lock:
+            try:
+                if task_id in self.running:
+                    task = self.running.pop(task_id)
+                    task.error = error
+                    
+                    # 先检查是否需要重试
+                    if task.retry_count < task.max_retries:
+                        task.retry_count += 1
+                        task.status = "pending"
+                        task.started_at = None
+                        
+                        task_key = self._get_task_key(task_id)
+                        self.redis_client.setex(task_key, 86400, json.dumps(task.to_dict()))
+                        queue_key = self._get_queue_key(task.priority)
+                        self.redis_client.lpush(queue_key, task_id)
+                    else:
+                        task.retry_count += 1
+                        task.status = "failed"
+                        task.completed_at = datetime.now()
+                        
+                        task_key = self._get_task_key(task_id)
+                        self.redis_client.setex(task_key, 86400, json.dumps(task.to_dict()))
+                        self.total_failed += 1
+                    
+                    return True
+                return False
+            except Exception as e:
+                self.logger.error(f"Failed to mark failed in Redis: {e}")
+                return False
 
     def get_stats(self) -> Dict[str, Any]:
-        try:
-            stats = {
-                'pending': {},
-                'running': 0,
-                'completed': 0,
-                'failed': 0
-            }
-            
-            total_pending = 0
-            for priority in TaskPriority:
-                queue_key = self._get_queue_key(priority)
-                count = self.redis_client.llen(queue_key)
-                stats['pending'][priority.name.lower()] = count
-                total_pending += count
-            
-            stats['pending']['total'] = total_pending
-            return stats
-        except Exception as e:
-            self.logger.error(f"Failed to get stats from Redis: {e}")
-            return {'pending': {'total': 0}, 'running': 0, 'completed': 0, 'failed': 0}
+        with self.lock:
+            try:
+                stats = {
+                    'pending': {},
+                    'running': len(self.running),
+                    'completed': self.total_completed,
+                    'failed': self.total_failed
+                }
+                
+                total_pending = 0
+                for priority in TaskPriority:
+                    queue_key = self._get_queue_key(priority)
+                    count = self.redis_client.llen(queue_key)
+                    stats['pending'][priority.name.lower()] = count
+                    total_pending += count
+                
+                stats['pending']['total'] = total_pending
+                return stats
+            except Exception as e:
+                self.logger.error(f"Failed to get stats from Redis: {e}")
+                return {
+                    'pending': {'total': 0, 'critical': 0, 'high': 0, 'normal': 0, 'low': 0},
+                    'running': 0,
+                    'completed': 0,
+                    'failed': 0
+                }
 
     def get_pending_count(self) -> int:
         stats = self.get_stats()
