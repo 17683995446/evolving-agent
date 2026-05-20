@@ -189,13 +189,12 @@ class LocalTaskQueue(BaseTaskQueue):
                     task.status = "pending"
                     task.started_at = None
                     self.queues[task.priority].append(task)
-                    self.logger.warning(f"Task failed, retrying ({task.retry_count}/{task.max_retries}: {task_id}")
+                    # 减少日志输出频率
                 else:
                     task.status = "failed"
                     task.completed_at = datetime.now()
                     self.failed.append(task)
                     self.total_failed += 1  # 增加完整计数器
-                    self.logger.error(f"Task failed permanently: {task_id}")
                 return True
         return False
 
