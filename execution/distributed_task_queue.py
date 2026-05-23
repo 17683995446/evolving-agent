@@ -173,8 +173,10 @@ class LocalTaskQueue(BaseTaskQueue):
                 task.result = result
                 self.completed.append(task)
                 self.total_completed += 1  # 增加完整计数器
-                self.logger.debug(f"Task completed: {task_id}")
+                self.logger.info(f"Task completed: {task_id}, total_completed={self.total_completed}")
                 return True
+            else:
+                self.logger.warning(f"Cannot complete task {task_id}: not in running queue")
         return False
 
     def fail(self, task_id: str, error: str) -> bool:
@@ -462,11 +464,15 @@ class DistributedTaskExecutor:
             if task.task_type in self.task_handlers:
                 handler = self.task_handlers[task.task_type]
                 result = handler(task.parameters)
-                self.queue.complete(task.task_id, result)
+                success = self.queue.complete(task.task_id, result)
+                if not success:
+                    self.logger.warning(f"Failed to complete task {task.task_id}: not in running queue")
             else:
                 raise ValueError(f"No handler for task type: {task.task_type}")
         except Exception as e:
-            self.queue.fail(task.task_id, str(e))
+            success = self.queue.fail(task.task_id, str(e))
+            if not success:
+                self.logger.warning(f"Failed to mark task {task.task_id} as failed: not in running queue")
 
     def get_statistics(self) -> Dict[str, Any]:
         """获取执行器统计"""
