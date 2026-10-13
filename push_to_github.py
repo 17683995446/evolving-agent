@@ -7,7 +7,7 @@ import requests
 import json
 import sys
 
-GITHUB_TOKEN = "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"
+GITHUB_TOKEN = "REDACTED_GITHUB_TOKEN"
 REPO_NAME = "evolving-agent"
 REPO_DESCRIPTION = "Persistent Evolving Agent System - No idle state, always executing and optimizing"
 
